@@ -61,6 +61,16 @@ class VADHandler:
 
         return completed
 
+    def has_speech(self, audio_int16: np.ndarray) -> bool:
+        """Check if any frame in the chunk contains speech (stateless — no side-effects)."""
+        pos = 0
+        while pos + FRAME_SIZE <= len(audio_int16):
+            frame = audio_int16[pos : pos + FRAME_SIZE]
+            if self._detect(frame):
+                return True
+            pos += FRAME_SIZE
+        return False
+
     def reset(self) -> None:
         self._pending = np.array([], dtype=np.int16)
         self._speech_buf = []

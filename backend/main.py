@@ -152,6 +152,21 @@ async def _thinking_keepalive(ws: WebSocket, interval: float = 8.0) -> None:
         pass
 
 
+_TTS_SENTENCE_ENDERS = frozenset(".!?\n")
+
+
+async def _synth_and_send_tts(ws: WebSocket, text: str) -> None:
+    """Synthesize a text segment and send the audio over the WebSocket."""
+    try:
+        wav = await tts.synthesize(text)
+        if wav:
+            await manager.send(
+                ws, {"type": "tts_audio", "data": base64.b64encode(wav).decode()}
+            )
+    except Exception as exc:
+        logger.error(f"TTS segment error: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Background tasks
 # ---------------------------------------------------------------------------
@@ -209,6 +224,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     tts_enabled: bool = False             # off by default
     thinking_enabled: bool = False        # off by default
     llm_busy: bool = False                # drop audio chunks while LLM is running
+    llm_cooldown_until: float = 0.0       # timestamp — ignore audio until this time
+
+    # Direct Audio accumulation — collects full recording (speech + silences)
+    # so the model receives natural audio up to 30 s instead of tiny fragments.
+    DIRECT_MAX_SECONDS = 30.0             # Gemma 4 audio hard limit
+    DIRECT_SILENCE_SECONDS = 2.0          # silence after speech → trigger send
+    direct_buf: np.ndarray = np.array([], dtype=np.int16)
+    direct_speech_detected: bool = False
+    direct_last_speech_ts: float = 0.0
 
     # ── Dedicated reader task ────────────────────────────────────────────────
     # Always keeps an active receive_text() call so WebSocket protocol-level
@@ -246,79 +270,72 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # Audio chunk from microphone
             # ---------------------------------------------------------------
             if msg_type == "audio_chunk":
-                # Drop audio silently while the LLM is still generating —
-                # prevents a burst of queued-up speech from triggering a
-                # second inference the moment the first one finishes.
-                if llm_busy:
+                # Drop audio while LLM is running or during post-inference
+                # cooldown (prevents TTS echo from triggering a new call).
+                if llm_busy or time.perf_counter() < llm_cooldown_until:
                     continue
 
                 audio_bytes = base64.b64decode(msg["data"])
                 audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
-                speech = vad.process_chunk(audio_int16)
 
-                if speech is not None and len(speech) > 3200:  # >200ms
-                    audio_f32 = speech.astype(np.float32) / 32768.0
-                    dur = len(speech) / 16000
+                # ===========================================================
+                # DIRECT AUDIO MODE — accumulate a full recording (up to 30 s)
+                # including natural silences, then send the entire buffer once.
+                # ===========================================================
+                if audio_mode == "direct":
+                    direct_buf = np.concatenate([direct_buf, audio_int16])
+
+                    if vad.has_speech(audio_int16):
+                        direct_speech_detected = True
+                        direct_last_speech_ts = time.perf_counter()
+
+                    buf_secs = len(direct_buf) / 16000
+                    silence_secs = (
+                        (time.perf_counter() - direct_last_speech_ts)
+                        if direct_speech_detected else 0.0
+                    )
+                    should_send = direct_speech_detected and (
+                        silence_secs >= DIRECT_SILENCE_SECONDS
+                        or buf_secs >= DIRECT_MAX_SECONDS
+                    )
+
+                    if not should_send:
+                        continue
+
+                    audio_f32 = direct_buf.astype(np.float32) / 32768.0
+                    dur = buf_secs
+                    direct_buf = np.array([], dtype=np.int16)
+                    direct_speech_detected = False
                     llm_busy = True
 
                     try:
-                        if audio_mode == "direct":
-                            # ── Direct: audio straight to Gemma 4 ──────────
-                            await send_pipeline(websocket, "thinking")
-                            await send_log(websocket, "info", f"Speech ({dur:.1f}s) → Gemma 4 directly…")
-                            t0 = time.perf_counter()
-                            _ka = asyncio.create_task(_thinking_keepalive(websocket))
-                            try:
-                                transcript, response = await llm.generate_with_audio(
-                                    audio_f32, 16000, latest_frame,
-                                    enable_thinking=thinking_enabled,
-                                )
-                            finally:
-                                _ka.cancel()
-                            llm_ms = (time.perf_counter() - t0) * 1000
+                        response = ""
+                        await send_pipeline(websocket, "thinking")
+                        await send_log(websocket, "info", f"Recording ({dur:.1f}s) → Gemma 4 directly…")
+                        t0 = time.perf_counter()
+                        _ka = asyncio.create_task(_thinking_keepalive(websocket))
+                        try:
+                            transcript, response = await llm.generate_with_audio(
+                                audio_f32, 16000, latest_frame,
+                                enable_thinking=thinking_enabled,
+                            )
+                        finally:
+                            _ka.cancel()
+                        llm_ms = (time.perf_counter() - t0) * 1000
 
-                            if transcript:
-                                await manager.send(
-                                    websocket,
-                                    {"type": "transcript", "data": {"text": transcript, "is_final": True}},
-                                )
-                            if not response.strip():
-                                continue
-
-                        else:
-                            # ── Whisper: STT → LLM ─────────────────────────
-                            await send_pipeline(websocket, "transcribing")
-                            await send_log(websocket, "info", f"Speech ({dur:.1f}s), transcribing…")
-                            t0 = time.perf_counter()
-                            transcript = await stt.transcribe(audio_f32)
-                            stt_ms = (time.perf_counter() - t0) * 1000
-
-                            if not transcript.strip():
-                                continue
-
+                        if transcript:
                             await manager.send(
                                 websocket,
                                 {"type": "transcript", "data": {"text": transcript, "is_final": True}},
                             )
-                            await send_log(websocket, "info", f"Transcript: {transcript}", stt_ms)
-
-                            await send_pipeline(websocket, "thinking")
-                            t1 = time.perf_counter()
-                            _ka = asyncio.create_task(_thinking_keepalive(websocket))
-                            try:
-                                response = await llm.generate(
-                                    transcript, latest_frame,
-                                    enable_thinking=thinking_enabled,
-                                )
-                            finally:
-                                _ka.cancel()
-                            llm_ms = (time.perf_counter() - t1) * 1000
+                        if not response.strip():
+                            continue
 
                         await manager.send(
                             websocket,
                             {"type": "llm_response", "data": {"text": response}},
                         )
-                        await send_log(websocket, "info", f"LLM: {response[:100]}", llm_ms)
+                        await send_log(websocket, "info", f"LLM: {response}", llm_ms)
 
                         if tts_enabled:
                             await send_pipeline(websocket, "speaking")
@@ -331,9 +348,103 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                     {"type": "tts_audio", "data": base64.b64encode(wav).decode()},
                                 )
                                 await send_log(websocket, "info", "TTS audio sent", tts_ms)
+                    finally:
+                        llm_busy = False
+                        vad.reset()
+                        llm_cooldown_until = time.perf_counter() + 2.0
+                        await send_pipeline(websocket, "idle")
+
+                    continue  # skip the Whisper path below
+
+                # ===========================================================
+                # WHISPER MODE — VAD detects end-of-speech, STT → LLM stream
+                # ===========================================================
+                speech = vad.process_chunk(audio_int16)
+
+                if speech is not None and len(speech) > 3200:  # >200ms
+                    audio_f32 = speech.astype(np.float32) / 32768.0
+                    dur = len(speech) / 16000
+                    llm_busy = True
+
+                    try:
+                        response = ""
+                        await send_pipeline(websocket, "transcribing")
+                        await send_log(websocket, "info", f"Speech ({dur:.1f}s), transcribing…")
+                        t0 = time.perf_counter()
+                        transcript = await stt.transcribe(audio_f32)
+                        stt_ms = (time.perf_counter() - t0) * 1000
+
+                        if not transcript.strip():
+                            continue
+
+                        await manager.send(
+                            websocket,
+                            {"type": "transcript", "data": {"text": transcript, "is_final": True}},
+                        )
+                        await send_log(websocket, "info", f"Transcript: {transcript}", stt_ms)
+
+                        await send_pipeline(websocket, "thinking")
+                        t1 = time.perf_counter()
+
+                        tts_buffer = ""
+                        tts_tasks: list = []
+
+                        _ka = asyncio.create_task(_thinking_keepalive(websocket))
+                        try:
+                            async for chunk in llm.generate_stream(
+                                transcript, latest_frame,
+                                enable_thinking=thinking_enabled,
+                            ):
+                                if not response:
+                                    _ka.cancel()
+                                    await manager.send(
+                                        websocket,
+                                        {"type": "llm_response_start", "data": {}},
+                                    )
+                                response += chunk
+                                await manager.send(
+                                    websocket,
+                                    {"type": "llm_chunk", "data": chunk},
+                                )
+
+                                if tts_enabled:
+                                    tts_buffer += chunk
+                                    stripped = tts_buffer.rstrip()
+                                    if stripped and (
+                                        stripped[-1] in _TTS_SENTENCE_ENDERS
+                                        or len(stripped) > 200
+                                    ):
+                                        seg = tts_buffer.strip()
+                                        tts_buffer = ""
+                                        if seg:
+                                            tts_tasks.append(
+                                                asyncio.create_task(
+                                                    _synth_and_send_tts(websocket, seg)
+                                                )
+                                            )
+                        finally:
+                            _ka.cancel()
+
+                        if tts_enabled and tts_buffer.strip():
+                            tts_tasks.append(
+                                asyncio.create_task(
+                                    _synth_and_send_tts(websocket, tts_buffer.strip())
+                                )
+                            )
+
+                        for t in tts_tasks:
+                            try:
+                                await t
+                            except Exception:
+                                pass
+
+                        llm_ms = (time.perf_counter() - t1) * 1000
+                        await send_log(websocket, "info", f"LLM: {response}", llm_ms)
 
                     finally:
                         llm_busy = False
+                        vad.reset()
+                        llm_cooldown_until = time.perf_counter() + 2.0
                         await send_pipeline(websocket, "idle")
 
             # ---------------------------------------------------------------
@@ -355,6 +466,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     )
                 if "audio_mode" in data:
                     audio_mode = str(data["audio_mode"])
+                    vad.reset()
+                    direct_buf = np.array([], dtype=np.int16)
+                    direct_speech_detected = False
                     await send_log(websocket, "info", f"Audio mode → {audio_mode}")
                 if "tts_enabled" in data:
                     tts_enabled = bool(data["tts_enabled"])

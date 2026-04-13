@@ -39,7 +39,7 @@ export interface LogEntry {
   latency_ms: number | null;
 }
 
-export type PipelineState = "idle" | "transcribing" | "thinking" | "speaking";
+export type PipelineState = "idle" | "transcribing" | "thinking" | "streaming" | "speaking";
 
 export type AudioMode = "whisper" | "direct";
 

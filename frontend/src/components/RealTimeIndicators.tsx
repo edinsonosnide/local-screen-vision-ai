@@ -6,6 +6,7 @@ interface Props {
   micActive: boolean;
   screenActive: boolean;
   pipelineState: PipelineState;
+  ttsPlaying: boolean;
 }
 
 function Indicator({
@@ -61,10 +62,13 @@ const PIPELINE_LABEL: Record<PipelineState, string> = {
   idle: "Idle",
   transcribing: "Transcribing…",
   thinking: "Thinking…",
+  streaming: "Generating…",
   speaking: "Speaking…",
 };
 
-export function RealTimeIndicators({ wsState, micActive, screenActive, pipelineState }: Props) {
+export function RealTimeIndicators({ wsState, micActive, screenActive, pipelineState, ttsPlaying }: Props) {
+  const ttsActive = pipelineState === "speaking" || ttsPlaying;
+
   return (
     <div className="flex items-center gap-4 flex-wrap">
       <ConnectionBadge state={wsState} />
@@ -89,7 +93,7 @@ export function RealTimeIndicators({ wsState, micActive, screenActive, pipelineS
         label={PIPELINE_LABEL[pipelineState]}
         active={pipelineState !== "idle"}
         color={
-          pipelineState === "thinking"
+          pipelineState === "thinking" || pipelineState === "streaming"
             ? "text-accent-purple"
             : pipelineState === "speaking"
             ? "text-accent-orange"
@@ -100,9 +104,9 @@ export function RealTimeIndicators({ wsState, micActive, screenActive, pipelineS
       <Indicator
         icon={Volume2}
         label="TTS"
-        active={pipelineState === "speaking"}
+        active={ttsActive}
         color="text-accent-orange"
-        pulse={pipelineState === "speaking"}
+        pulse={ttsActive}
       />
     </div>
   );

@@ -55,7 +55,10 @@ export default function App() {
   const [transcript, setTranscript] = useState("");
   const [llmResponse, setLlmResponse] = useState("");
   const [pipelineState, setPipelineState] = useState<PipelineState>("idle");
+  const [ttsPlaying, setTtsPlaying] = useState(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const ttsQueueRef = useRef<string[]>([]);
+  const ttsPlayingRef = useRef(false);
   const ttsEnabledRef = useRef(config.ttsEnabled);
   useEffect(() => { ttsEnabledRef.current = config.ttsEnabled; }, [config.ttsEnabled]);
 
@@ -67,26 +70,49 @@ export default function App() {
   }, []);
 
   // -------------------------------------------------------------------------
-  // TTS audio playback
+  // TTS audio playback — sequential queue so segments don't overlap
   // -------------------------------------------------------------------------
-  const playTTSAudio = useCallback(async (b64: string) => {
+  const drainTTSQueue = useCallback(async function drain() {
+    if (ttsPlayingRef.current) return;
+    const b64 = ttsQueueRef.current.shift();
+    if (!b64) {
+      setTtsPlaying(false);
+      return;
+    }
+
+    ttsPlayingRef.current = true;
+    setTtsPlaying(true);
     try {
       if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
         audioCtxRef.current = new AudioContext();
       }
       const ctx = audioCtxRef.current;
+      if (ctx.state === "suspended") await ctx.resume();
+
       const binary = atob(b64);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const decoded = await ctx.decodeAudioData(bytes.buffer);
+      const buf = bytes.buffer.slice(0);
+      const decoded = await ctx.decodeAudioData(buf);
       const src = ctx.createBufferSource();
       src.buffer = decoded;
       src.connect(ctx.destination);
+      src.addEventListener("ended", () => {
+        ttsPlayingRef.current = false;
+        drain();
+      });
       src.start();
     } catch (err) {
+      ttsPlayingRef.current = false;
       addLog({ level: "error", message: `Audio playback error: ${err}`, timestamp: Date.now() / 1000, latency_ms: null });
+      drain();
     }
   }, [addLog]);
+
+  const enqueueTTS = useCallback((b64: string) => {
+    ttsQueueRef.current.push(b64);
+    void drainTTSQueue();
+  }, [drainTTSQueue]);
 
   // -------------------------------------------------------------------------
   // WebSocket
@@ -115,8 +141,17 @@ export default function App() {
           setLlmResponse(d.text);
           break;
         }
+        case "llm_response_start":
+          // New streaming response beginning — clear previous answer
+          setLlmResponse("");
+          setPipelineState("streaming");
+          break;
+        case "llm_chunk":
+          // Streaming delta — append to current response
+          setLlmResponse((prev) => prev + (msg.data as string));
+          break;
         case "tts_audio":
-          if (ttsEnabledRef.current) void playTTSAudio(msg.data as string);
+          if (ttsEnabledRef.current) enqueueTTS(msg.data as string);
           break;
         case "pipeline_state":
           setPipelineState((msg.data as string) as PipelineState);
@@ -125,7 +160,7 @@ export default function App() {
           break;
       }
     },
-    [addLog, playTTSAudio]
+    [addLog, enqueueTTS]
   );
 
   const { state: wsState, send } = useWebSocket({
@@ -231,6 +266,7 @@ export default function App() {
           micActive={mic.active}
           screenActive={screen.active}
           pipelineState={pipelineState}
+          ttsPlaying={ttsPlaying}
         />
 
         <div className="h-5 w-px bg-surface-border ml-2" />
@@ -275,6 +311,7 @@ export default function App() {
             transcript={transcript}
             llmResponse={llmResponse}
             pipelineState={pipelineState}
+            ttsPlaying={ttsPlaying}
           />
         </div>
 

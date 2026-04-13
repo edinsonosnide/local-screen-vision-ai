@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -13,6 +14,36 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_TURNS = 10  # keep last N user+assistant pairs
+
+# Gemma 4 thinking-mode delimiters.
+# The thinking block opens with a channel marker (e.g. <|channel>thought)
+# and the actual response starts right after the <channel|> token.
+_RESPONSE_MARKER = "<channel|>"
+
+# Regex that catches every channel-like token variant for cleanup.
+_CHANNEL_RE = re.compile(r"<\|?channel\|?>(?:thought|response)?")
+
+_LITERAL_STRIP = (
+    "<|channel|>response", "<|channel|>thought",
+    "<|channel>thought", "<|channel>response",
+    "<channel|>", "<|channel>", "<|channel|>",
+    "<turn|>", "<|turn|>", "<end_of_turn>", "<eos>", "<bos>",
+)
+
+
+def _strip_tokens(text: str) -> str:
+    """Strip Gemma 4 special / channel tokens from a text fragment."""
+    text = _CHANNEL_RE.sub("", text)
+    for tok in _LITERAL_STRIP:
+        text = text.replace(tok, "")
+    return text
+
+
+def _extract_final_response(raw: str) -> str:
+    """Return only the final answer, stripping any Gemma 4 thinking block."""
+    if _RESPONSE_MARKER in raw:
+        raw = raw.split(_RESPONSE_MARKER, 1)[1]
+    return _strip_tokens(raw).strip()
 
 
 class LLMHandler:
@@ -190,16 +221,7 @@ class LLMHandler:
                 raw = self._processor.decode(
                     outputs[0][input_len:], skip_special_tokens=False
                 )
-                parsed = self._processor.parse_response(raw)
-                # parse_response may return a str or a dict {"text": ..., "think": ...}
-                if isinstance(parsed, dict):
-                    text = str(parsed.get("text") or parsed.get("response") or raw)
-                else:
-                    text = str(parsed)
-                # Strip Gemma 4 residual special tokens that leak through
-                for tok in ("<turn|>", "<|turn|>", "<end_of_turn>", "<eos>", "<bos>"):
-                    text = text.replace(tok, "")
-                return text.strip()
+                return _extract_final_response(raw)
 
             response: str = await loop.run_in_executor(None, _infer)
 
@@ -218,13 +240,166 @@ class LLMHandler:
                 self._history = self._history[-max_msgs:]
 
             self._last_latency_ms = (time.perf_counter() - t0) * 1000
-            logger.info(f"LLM {self._last_latency_ms:.0f}ms: {response[:120]}")
+            logger.info(f"LLM {self._last_latency_ms:.0f}ms: {response}")
             return response
 
         except Exception as exc:
             self.error = str(exc)
             logger.error(f"LLM generate error: {exc}")
             return f"Error: {exc}"
+        finally:
+            self.status = "idle"
+
+    async def generate_stream(
+        self,
+        user_text: str,
+        image_b64: Optional[str] = None,
+        enable_thinking: Optional[bool] = None,
+    ):
+        """
+        Async generator yielding response text chunks as they are produced.
+        Thinking blocks are buffered silently; only the final answer is streamed.
+        """
+        if self._model is None:
+            yield "(LLM not loaded — check model path in config.yaml)"
+            return
+
+        self.status = "running"
+        t0 = time.perf_counter()
+        full_response = ""
+
+        try:
+            import threading as _threading
+            import torch  # type: ignore
+            from transformers import TextIteratorStreamer  # type: ignore
+
+            content: List[Dict] = []
+            if image_b64:
+                from PIL import Image  # type: ignore
+                img = Image.open(io.BytesIO(base64.b64decode(image_b64)))
+                content.append({"type": "image", "image": img})
+            content.append({"type": "text", "text": user_text})
+
+            self._history.append({"role": "user", "content": content})
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": (
+                        "You are a helpful, concise assistant that can see the "
+                        "user's screen. Respond clearly and briefly."
+                    )}],
+                },
+                *self._history,
+            ]
+
+            thinking = enable_thinking if enable_thinking is not None else self.enable_thinking
+
+            inputs = self._processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                add_generation_prompt=True,
+                enable_thinking=thinking,
+            ).to(self._model.device)
+
+            # Use the underlying tokenizer for the streamer
+            tokenizer = getattr(self._processor, "tokenizer", self._processor)
+            streamer = TextIteratorStreamer(
+                tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=False,
+                timeout=120.0,
+            )
+
+            loop = asyncio.get_event_loop()
+            token_queue: asyncio.Queue = asyncio.Queue()
+
+            def _run() -> None:
+                """Executor thread: runs generation then forwards tokens to asyncio queue."""
+                try:
+                    gen_thread = _threading.Thread(
+                        target=lambda: self._model.generate(
+                            **inputs,
+                            max_new_tokens=self.max_new_tokens,
+                            do_sample=True,
+                            temperature=1.0,
+                            top_p=0.95,
+                            top_k=64,
+                            streamer=streamer,
+                        ),
+                        daemon=True,
+                    )
+                    gen_thread.start()
+                    for token in streamer:
+                        loop.call_soon_threadsafe(token_queue.put_nowait, token)
+                    gen_thread.join()
+                except Exception as exc:
+                    loop.call_soon_threadsafe(token_queue.put_nowait, exc)
+                finally:
+                    loop.call_soon_threadsafe(token_queue.put_nowait, None)
+
+            executor_task = loop.run_in_executor(None, _run)
+
+            # Stream tokens, silently buffering the thinking block.
+            # When thinking is on we absorb everything until <channel|>
+            # appears — that token marks the start of the actual response.
+            raw_buffer = ""
+            response_started = not thinking  # yield immediately when thinking is off
+
+            while True:
+                item = await token_queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+
+                token: str = item
+                raw_buffer += token
+
+                if not response_started:
+                    if _RESPONSE_MARKER in raw_buffer:
+                        response_started = True
+                        after = raw_buffer.split(_RESPONSE_MARKER, 1)[1]
+                        clean = _strip_tokens(after)
+                        if clean:
+                            full_response += clean
+                            yield clean
+                else:
+                    clean = _strip_tokens(token)
+                    if clean:
+                        full_response += clean
+                        yield clean
+
+            await executor_task
+
+            # Fallback: if no response marker appeared, extract from buffer
+            if not full_response:
+                full_response = _extract_final_response(raw_buffer)
+                if full_response:
+                    yield full_response
+
+            # Update conversation history (text-only, no image objects)
+            self._history[-1] = {
+                "role": "user",
+                "content": [{"type": "text", "text": user_text}],
+            }
+            self._history.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": full_response}],
+            })
+            max_msgs = MAX_HISTORY_TURNS * 2
+            if len(self._history) > max_msgs:
+                self._history = self._history[-max_msgs:]
+
+            self._last_latency_ms = (time.perf_counter() - t0) * 1000
+            logger.info(f"LLM stream {self._last_latency_ms:.0f}ms: {full_response}")
+
+        except Exception as exc:
+            self.error = str(exc)
+            logger.error(f"LLM stream error: {exc}")
+            yield f"Error: {exc}"
         finally:
             self.status = "idle"
 
@@ -307,14 +482,7 @@ class LLMHandler:
                 raw = self._processor.decode(
                     outputs[0][input_len:], skip_special_tokens=False
                 )
-                parsed = self._processor.parse_response(raw)
-                if isinstance(parsed, dict):
-                    text = str(parsed.get("text") or parsed.get("response") or raw)
-                else:
-                    text = str(parsed)
-                for tok in ("<turn|>", "<|turn|>", "<end_of_turn>", "<eos>", "<bos>"):
-                    text = text.replace(tok, "")
-                return text.strip()
+                return _extract_final_response(raw)
 
             full_response: str = await loop.run_in_executor(None, _infer)
 
@@ -341,7 +509,7 @@ class LLMHandler:
                 self._history = self._history[-max_msgs:]
 
             self._last_latency_ms = (time.perf_counter() - t0) * 1000
-            logger.info(f"LLM(audio) {self._last_latency_ms:.0f}ms | transcript: {transcript[:80]}")
+            logger.info(f"LLM(audio) {self._last_latency_ms:.0f}ms | transcript: {transcript}")
             return transcript, response
 
         except Exception as exc:

@@ -5,6 +5,7 @@ interface Props {
   transcript: string;
   llmResponse: string;
   pipelineState: PipelineState;
+  ttsPlaying: boolean;
 }
 
 function PipelineBadge({ state }: { state: PipelineState }) {
@@ -12,6 +13,7 @@ function PipelineBadge({ state }: { state: PipelineState }) {
   const map: Record<Exclude<PipelineState, "idle">, { label: string; cls: string }> = {
     transcribing: { label: "Transcribing…", cls: "text-accent-yellow bg-accent-yellow/10 border-accent-yellow/20" },
     thinking: { label: "Thinking…", cls: "text-accent-purple bg-accent-purple/10 border-accent-purple/20" },
+    streaming: { label: "Generating…", cls: "text-accent-purple bg-accent-purple/10 border-accent-purple/20" },
     speaking: { label: "Speaking…", cls: "text-accent-orange bg-accent-orange/10 border-accent-orange/20" },
   };
   const { label, cls } = map[state as Exclude<PipelineState, "idle">];
@@ -22,7 +24,7 @@ function PipelineBadge({ state }: { state: PipelineState }) {
   );
 }
 
-export function SystemDisplay({ transcript, llmResponse, pipelineState }: Props) {
+export function SystemDisplay({ transcript, llmResponse, pipelineState, ttsPlaying }: Props) {
   return (
     <div className="card flex flex-col gap-0 overflow-hidden h-full">
       {/* Header */}
@@ -65,10 +67,13 @@ export function SystemDisplay({ transcript, llmResponse, pipelineState }: Props)
           {llmResponse ? (
             <p className="text-sm text-gray-200 leading-relaxed whitespace-pre-wrap">
               {llmResponse}
+              {pipelineState === "streaming" && (
+                <span className="inline-block w-0.5 h-[1em] bg-accent-purple ml-0.5 align-middle animate-pulse" />
+              )}
             </p>
           ) : (
             <p className="text-sm text-gray-600 italic">
-              {pipelineState === "thinking"
+              {pipelineState === "thinking" || pipelineState === "streaming"
                 ? "Generating response…"
                 : "Response will appear here."}
             </p>
@@ -86,10 +91,15 @@ export function SystemDisplay({ transcript, llmResponse, pipelineState }: Props)
                 speaking: { label: "TTS", color: "bg-accent-orange" },
               };
               const s = states[step];
-              const isActive = pipelineState === step;
+              const ttsActive = pipelineState === "speaking" || ttsPlaying;
+              const isActive =
+                pipelineState === step ||
+                (step === "thinking" && pipelineState === "streaming") ||
+                (step === "speaking" && ttsActive);
               const isDone =
-                (step === "transcribing" && (pipelineState === "thinking" || pipelineState === "speaking")) ||
-                (step === "thinking" && pipelineState === "speaking");
+                (step === "transcribing" &&
+                  (pipelineState === "thinking" || pipelineState === "streaming" || pipelineState === "speaking" || ttsActive)) ||
+                (step === "thinking" && (pipelineState === "speaking" || ttsActive));
               return (
                 <div key={step} className="flex items-center gap-1">
                   <div

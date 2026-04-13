@@ -4,7 +4,8 @@ A fully local, privacy-first multimodal assistant that can:
 - Listen to your microphone in real time (Voice Activity Detection + Whisper STT)
 - Watch your screen continuously (configurable frame capture)
 - Understand and respond using **Gemma 4 E2B-it** on your GPU
-- Speak responses via local TTS (Kokoro / Windows SAPI fallback)
+- **Stream responses word-by-word** as they are generated
+- Speak responses via local TTS (Kokoro / Windows SAPI fallback), streamed sentence-by-sentence
 
 All processing runs **100% locally** — no data leaves your machine after setup.
 
@@ -15,10 +16,13 @@ All processing runs **100% locally** — no data leaves your machine after setup
 | Component | Status | Notes |
 |-----------|--------|-------|
 | STT (Whisper) | ✅ Working | `faster-whisper` base model, ~5-20ms |
-| LLM (Gemma 4 E2B-it) | ✅ Working on GPU | bfloat16, ~25-45s on RTX 2070 SUPER |
+| LLM (Gemma 4 E2B-it) | ✅ Working on GPU | bfloat16, ~3-5s streaming on RTX 2070 SUPER |
+| LLM streaming | ✅ Working | Token-by-token output via `TextIteratorStreamer` |
 | Screen vision | ✅ Working | Model correctly reads and describes screen |
-| TTS (SAPI) | ✅ Working | Disabled by default — enable via UI toggle |
-| WebSocket stability | ✅ Stable | Two-task reader pattern prevents buffer timeouts |
+| TTS (streaming) | ✅ Working | Sentence-by-sentence during LLM streaming, queued playback |
+| Thinking mode | ✅ Working | Chain-of-thought hidden; only final answer streamed |
+| Direct Audio | ⚠️ Beta | Full recording (up to 30 s) sent to Gemma 4 natively |
+| WebSocket stability | ✅ Stable | Two-task reader pattern + cooldown prevents disconnects |
 | GPU acceleration | ✅ Working | Auto-detects CUDA, loads model in bfloat16 |
 
 ---
@@ -28,13 +32,28 @@ All processing runs **100% locally** — no data leaves your machine after setup
 ```
 Browser (React + TypeScript + Vite)
     │  WebSocket  ws://localhost:8000/ws
+    │
+    │  ← llm_response_start         (clear display, start streaming)
+    │  ← llm_chunk                   (append text delta)
+    │  ← tts_audio                   (sentence audio, queued playback)
+    │  ← pipeline_state              (idle / transcribing / thinking / streaming / speaking)
+    │
     ▼
 FastAPI backend (Python)
     ├── VAD    — webrtcvad-wheels (WebRTC Voice Activity Detection)
     ├── STT    — faster-whisper (Whisper base)
     ├── LLM    — Gemma 4 E2B-it (HuggingFace transformers, GPU bfloat16)
+    │            ├── generate_stream()  — async generator via TextIteratorStreamer
+    │            └── generate_with_audio() — Direct Audio path (batch)
     └── TTS    — kokoro-onnx (auto-download) / Windows SAPI fallback
 ```
+
+### Audio pipelines
+
+| Mode | Flow | Streaming | TTS |
+|------|------|-----------|-----|
+| **Whisper STT** (default) | Mic → VAD → STT → text → `generate_stream()` | ✅ Token-by-token | ✅ Sentence-by-sentence |
+| **Direct Audio** (beta) | Mic → accumulate up to 30 s → `generate_with_audio()` | ❌ Full response | One-shot after response |
 
 ---
 
@@ -120,9 +139,10 @@ Backend runs at `http://localhost:8000`.
 2. Click **Share Screen** — a frame is captured within 300ms
 3. Click **Start Mic** and speak naturally
 4. The system detects when you stop talking, sends your speech + screen frame to the model
-5. Response appears as text in the **ASSISTANT** panel
+5. Response **streams word-by-word** in the ASSISTANT panel with a blinking cursor
+6. If TTS is enabled, audio plays sentence-by-sentence as text streams — you hear the answer while it's still being generated
 
-> **Tip**: First inference takes ~25-45s on an RTX 2070 SUPER. Subsequent calls are similar — Gemma 4 E2B is a full multimodal model. The UI sends keepalive pings during inference to prevent disconnects.
+> **Tip**: First inference takes ~3-5s on an RTX 2070 SUPER with streaming. The UI shows a "Generating…" badge and blinking cursor during output.
 
 ---
 
@@ -132,19 +152,18 @@ Backend runs at `http://localhost:8000`.
 
 | Control | Default | Description |
 |---------|---------|-------------|
-| **Whisper STT / Direct Audio** | Whisper STT | Whisper STT: audio → Whisper → text → Gemma 4. Direct Audio: audio straight to Gemma 4 (experimental) |
-| **Thinking off / on** | Off | Enables Gemma 4's chain-of-thought reasoning (slower but more accurate) |
-| **TTS off / on** | **Off** | Synthesizes and plays the response via Kokoro / Windows SAPI. Off by default for stability |
-| **Frame interval** | 1.5s | How often the screen is captured and sent |
-| **VAD silence** | 1.2s | Silence duration before ending a speech segment |
+| **Whisper STT / Direct Audio** | Whisper STT | Whisper: fast transcription + streaming LLM. Direct Audio (beta): records up to 30 s and sends to Gemma 4 natively — experimental, may echo or repeat |
+| **Thinking off / on** | Off | Enables Gemma 4's chain-of-thought reasoning. Thinking tokens are hidden; only the final answer is streamed. Better quality but slower |
+| **TTS off / on** | **Off** | Streams audio sentence-by-sentence as text generates. Use headphones to avoid mic echo triggering repeated answers |
+| **Frame interval** | 1.5s | How often a screenshot is sent. Lower = better screen awareness, more GPU load |
+| **VAD silence** | 0.8s | Whisper mode: silence needed to end speech. Too low = cuts you off. Too high = long wait. Direct Audio uses a fixed 2 s threshold |
 | **Clear history** | — | Resets the LLM conversation context |
 
-### Model Status panel
+### Indicators
 
-Each model card shows:
-- Status dot (green = idle, blue = running, yellow = loading, red = error)
-- **CPU / GPU badge** — confirms whether the LLM is on your GPU
-- Last inference latency in ms
+- **Pipeline badge**: Idle → Transcribing → Thinking → Generating → Speaking
+- **TTS indicator**: Lights up orange when audio is actively playing (tracked client-side via audio queue events, independent of backend state)
+- **GPU/CPU badge**: Confirms whether the LLM is running on your GPU
 
 ---
 
@@ -158,7 +177,7 @@ Each model card shows:
 | `llm.device` | `auto` | `auto`, `cuda`, or `cpu` |
 | `llm.enable_thinking` | `false` | Default thinking mode (overridden per-session via UI) |
 | `llm.max_new_tokens` | `512` | Max tokens to generate |
-| `llm.image_token_budget` | `280` | Vision resolution (70/140/280/560/1120) |
+| `llm.image_token_budget` | `70` | Vision resolution — tokens per image (70/140/280/560/1120). Lower = faster, less detail |
 | `tts.voice` | `af_heart` | Kokoro voice name |
 | `tts.speed` | `1.0` | Speech speed multiplier |
 | `vision.frame_interval` | `1.5` | Seconds between screen captures |
@@ -178,13 +197,13 @@ local-screen-vision-ai/
 │   ├── requirements.txt
 │   └── handlers/
 │       ├── stt.py           # faster-whisper STT
-│       ├── llm.py           # Gemma 4 E2B-it (bfloat16 GPU / CPU fallback)
+│       ├── llm.py           # Gemma 4 E2B-it (bfloat16 GPU, streaming + batch)
 │       ├── tts.py           # kokoro-onnx (auto-download) + Windows SAPI fallback
 │       ├── hardware.py      # CPU / RAM / GPU monitoring (nvidia-ml-py)
-│       └── vad.py           # WebRTC VAD + energy fallback
+│       └── vad.py           # WebRTC VAD + energy fallback + stateless has_speech()
 ├── frontend/
 │   ├── src/
-│   │   ├── App.tsx          # Main component, config state, WebSocket orchestration
+│   │   ├── App.tsx          # Main component, TTS queue, WebSocket orchestration
 │   │   ├── hooks/
 │   │   │   ├── useWebSocket.ts     # Auto-reconnect, stable callback refs
 │   │   │   ├── useMicrophone.ts    # AudioWorklet 16kHz capture
@@ -192,10 +211,10 @@ local-screen-vision-ai/
 │   │   ├── components/
 │   │   │   ├── ModelStatusPanel.tsx  # Per-model status + CPU/GPU badge
 │   │   │   ├── HardwarePanel.tsx     # CPU/RAM/VRAM meters
-│   │   │   ├── RealTimeIndicators.tsx
-│   │   │   ├── SystemDisplay.tsx     # Transcript + LLM response + pipeline
+│   │   │   ├── RealTimeIndicators.tsx # Pipeline + TTS playback indicators
+│   │   │   ├── SystemDisplay.tsx     # Transcript + streaming LLM response + pipeline viz
 │   │   │   ├── DebugLog.tsx          # Filterable timestamped logs
-│   │   │   └── ConfigPanel.tsx       # All runtime toggles and sliders
+│   │   │   └── ConfigPanel.tsx       # Toggles, sliders, hints, Direct Audio warning
 │   │   └── types/index.ts
 │   └── public/
 │       └── audio-processor.js   # AudioWorklet: mic → 16kHz PCM16
@@ -216,12 +235,35 @@ local-screen-vision-ai/
 - Gemma 4 E2B-it (~2B parameters) in bfloat16 is ~4 GB — fits comfortably in 8 GB VRAM. No quantization needed on a typical gaming GPU.
 - `bitsandbytes` 0.49.2 is incompatible with `transformers` 5.x (`Params4bit.__new__() got an unexpected keyword argument '_is_hf_initialized'`). Skip quantization unless you specifically need it for VRAM constraints.
 
+### LLM Streaming
+
+- `TextIteratorStreamer` from `transformers` provides token-by-token output. It must run in a separate thread (`threading.Thread`) since `model.generate()` is blocking.
+- An executor thread reads from the streamer iterator and pushes tokens into an `asyncio.Queue` via `loop.call_soon_threadsafe`, bridging the sync/async boundary.
+- When Gemma 4's thinking mode is on, tokens are silently buffered until the `<channel|>` response marker appears. Everything before it (the thinking block) is never shown to the user or spoken by TTS.
+- The frontend receives `llm_response_start` (clear + switch to "streaming" state) followed by `llm_chunk` deltas, showing a blinking cursor until generation completes.
+
+### Streaming TTS
+
+- TTS synthesis runs concurrently with LLM streaming — each sentence boundary (`.!?\n` or 200+ chars) triggers an `asyncio.create_task` for synthesis.
+- The frontend maintains a sequential audio queue (`ttsQueueRef`). Each segment plays to completion before the next starts, preventing overlap.
+- Chrome's autoplay policy suspends `AudioContext` until a user gesture. The fix: call `ctx.resume()` before playing if the context is suspended.
+- The `ttsPlaying` state is tracked independently from the backend's pipeline state (via `BufferSource.ended` events), so the TTS indicator correctly shows active playback even after the backend goes idle.
+
 ### WebSocket stability
 
 - A single-loop WebSocket handler that calls `await receive_text()` once per iteration will **block** while `await llm.generate()` runs. Audio chunks pile up in the TCP buffer; when it fills, the OS applies backpressure, timeouts fire, and the connection drops.
 - Fix: **two-task pattern** — a dedicated `_reader` coroutine always has an active `receive_text()` call, continuously draining the socket. The processor reads from an asyncio Queue. This prevents buffer fill regardless of inference time.
 - Drop audio chunks with an `llm_busy` flag while the model is generating. Without this, all buffered audio is processed immediately after inference ends, potentially triggering a second LLM call from speech the user uttered while waiting.
+- A 2-second cooldown after each inference prevents TTS echo from the speakers being picked up by the microphone and triggering a feedback loop.
 - Add a server-side keepalive (send `pipeline_state: thinking` every 8s during inference) as a secondary mechanism to prevent browser-side idle timeouts.
+
+### Direct Audio mode
+
+- Gemma 4's audio encoder accepts up to **30 seconds** at 16 kHz (25 tokens/second). There is no streaming audio API — the model processes audio as a complete batch.
+- The old approach reused VAD's short-silence detection (0.8s), sending tiny 1-3s fragments. This caused repeated LLM calls with the same question due to sentence fragments and echo.
+- Fix: Direct Audio now **accumulates all audio** (speech + natural pauses) into one continuous buffer. It only sends when: (a) 2 seconds of silence follow detected speech, or (b) the buffer reaches 30 seconds.
+- A stateless `vad.has_speech()` method checks each chunk for voice activity without modifying the VAD's internal state or buffers.
+- Mode switching resets both the VAD and the direct audio buffer to prevent stale audio from carrying over.
 
 ### HuggingFace model loading on Windows
 
@@ -235,10 +277,17 @@ local-screen-vision-ai/
 - Windows SAPI COM objects require `pythoncom.CoInitialize()` on every thread before use, and `CoUninitialize()` when done.
 - Kokoro ONNX (`kokoro-onnx`) provides high-quality neural TTS but the model files must be present. Auto-download from HuggingFace Hub on first run.
 
+### Thinking mode
+
+- Gemma 4's thinking output uses channel markers: `<|channel>thought...thinking...<channel|>actual response`. The `<channel|>` token is the boundary between internal reasoning and the final answer.
+- During streaming, all tokens before `<channel|>` are silently absorbed. After the marker, tokens are streamed normally to the frontend.
+- A regex-based cleanup (`_CHANNEL_RE`) strips all channel marker variants from both streaming chunks and batch responses, ensuring no raw tokens leak to the UI.
+
 ### Screen vision
 
 - `latest_frame` is `None` until the first capture fires. If the user speaks before any frame is captured (e.g., with a 10s interval), the model receives no image and responds as a text-only AI.
 - Fix: capture the first frame 300ms after screen sharing starts, independent of the regular interval. Also cap the interval slider at 5s.
+- `image_token_budget` controls vision resolution (70/140/280/560/1120 tokens). Lower values (70) trade detail for speed — useful on limited VRAM or when screen content is simple.
 
 ### VAD / STT
 
