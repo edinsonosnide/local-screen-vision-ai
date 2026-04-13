@@ -3,7 +3,7 @@
 A fully local, privacy-first multimodal assistant that can:
 - Listen to your microphone in real time (Voice Activity Detection + Whisper STT)
 - Watch your screen continuously (configurable frame capture)
-- Understand and respond using **Gemma 4 E2B-it** on your GPU
+- Understand and respond using **Gemma 4 E2B-it** via LiteRT-LM (default, optimized) or HF Transformers (GPU fallback)
 - **Stream responses word-by-word** as they are generated
 - Speak responses via local TTS (Kokoro / Windows SAPI fallback), streamed sentence-by-sentence
 
@@ -16,14 +16,15 @@ All processing runs **100% locally** — no data leaves your machine after setup
 | Component | Status | Notes |
 |-----------|--------|-------|
 | STT (Whisper) | ✅ Working | `faster-whisper` base model |
-| LLM (Gemma 4 E2B-it) | ✅ Working on GPU | bfloat16, RTX 2070 SUPER |
-| LLM streaming | ✅ Working | Token-by-token output via `TextIteratorStreamer` |
+| LLM (Gemma 4 via LiteRT-LM) | ✅ Default | Int4 quantized, XNNPACK CPU accel. ~2.58 GB, auto-downloaded |
+| LLM (Gemma 4 via Transformers) | ✅ Fallback | bfloat16 on GPU. Set `llm.backend: transformers` in config |
+| LLM streaming | ✅ Working | Token-by-token via LiteRT-LM `send_message_async` or HF `TextIteratorStreamer` |
 | Screen vision | ✅ Working | Model correctly reads and describes screen |
 | TTS (streaming) | ✅ Working | Sentence-by-sentence during LLM streaming, queued playback |
 | Thinking mode | ✅ Working | Chain-of-thought hidden; only final answer streamed |
 | Direct Audio | ⚠️ Beta | Full recording (up to 30 s) sent to Gemma 4 natively |
 | WebSocket stability | ✅ Stable | Two-task reader pattern + cooldown prevents disconnects |
-| GPU acceleration | ✅ Working | Auto-detects CUDA, loads model in bfloat16 |
+| GPU acceleration | ⚠️ Partial | Transformers: CUDA bfloat16. LiteRT-LM: XNNPACK CPU only (GPU/Vulkan falls back to software rendering in WSL) |
 
 ### Observed Latency (RTX 2070 SUPER 8 GB, Whisper base, Thinking off)
 
@@ -52,9 +53,11 @@ Browser (React + TypeScript + Vite)
 FastAPI backend (Python)
     ├── VAD    — webrtcvad-wheels (WebRTC Voice Activity Detection)
     ├── STT    — faster-whisper (Whisper base)
-    ├── LLM    — Gemma 4 E2B-it (HuggingFace transformers, GPU bfloat16)
-    │            ├── generate_stream()  — async generator via TextIteratorStreamer
-    │            └── generate_with_audio() — Direct Audio path (batch)
+    ├── LLM    — configurable backend (llm.backend in config.yaml):
+    │            ├── "litert"       → Gemma 4 E2B-it via LiteRT-LM (int4, XNNPACK)
+    │            │                    2.58 GB, auto-downloaded from HuggingFace on first run
+    │            └── "transformers" → Gemma 4 E2B-it via HF Transformers (bfloat16, GPU)
+    │            Both expose: generate_stream(), generate_with_audio(), clear_history()
     └── TTS    — kokoro-onnx (auto-download) / Windows SAPI fallback
 ```
 
@@ -71,25 +74,26 @@ FastAPI backend (Python)
 
 - Python 3.10+
 - Node.js 18+
-- 16 GB RAM minimum (model loads to GPU, but CPU RAM is needed during load)
-- **NVIDIA GPU with 6+ GB VRAM** (tested on RTX 2070 SUPER 8 GB)
-- CUDA 12.x driver
+- 16 GB RAM minimum
 
-> CPU-only fallback works but expect 3–5 minute response times.
+**LiteRT-LM backend (default):** No GPU required. Runs on CPU with XNNPACK acceleration. Model (~2.58 GB) is auto-downloaded from HuggingFace on first run.
+
+**Transformers backend (fallback):** NVIDIA GPU with 6+ GB VRAM (tested on RTX 2070 SUPER 8 GB) + CUDA 12.x driver.
 
 ---
 
 ## Setup
 
-### 1. Download Gemma 4 E2B-it
+### 1. Accept Gemma license on HuggingFace
+
+Visit https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm and accept the Gemma license. Then log in:
 
 ```bash
 pip install huggingface-hub
-huggingface-cli download google/gemma-4-E2B-it \
-  --local-dir ./resources/multimodal/gemma-4-E2B-it
+huggingface-cli login
 ```
 
-> Accept the model license at https://huggingface.co/google/gemma-4-E2B-it first.
+> The LiteRT-LM model (~2.58 GB) is **auto-downloaded** on first backend start. No manual download needed.
 
 ### 2. Backend — Python environment
 
@@ -100,12 +104,15 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 3. Install CUDA-enabled PyTorch (required for GPU)
+### 3. (Optional) Transformers backend — CUDA PyTorch + Gemma 4
 
-The default `pip install torch` installs a CPU-only build. You **must** run this separately:
+Only needed if you set `llm.backend: transformers` in `config.yaml`:
 
 ```powershell
-# For CUDA 12.1 (adjust cu121 → cu118 / cu124 for your driver)
+# Download Gemma 4 E2B-it model files
+huggingface-cli download google/gemma-4-E2B-it --local-dir ./resources/multimodal/gemma-4-E2B-it
+
+# Install CUDA-enabled PyTorch (CPU-only ships by default)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
@@ -183,11 +190,14 @@ Backend runs at `http://localhost:8000`.
 |-----|---------|-------------|
 | `stt.model` | `base` | Whisper model size (`tiny`, `base`, `small`, `medium`, `large-v3`) |
 | `stt.language` | `en` | Transcription language |
-| `llm.model_path` | `../resources/multimodal/gemma-4-E2B-it` | Path relative to `backend/` |
-| `llm.device` | `auto` | `auto`, `cuda`, or `cpu` |
+| **`llm.backend`** | **`litert`** | **`litert` (LiteRT-LM, optimized) or `transformers` (HF, GPU)** |
+| `llm.litert_model_repo` | `litert-community/gemma-4-E2B-it-litert-lm` | HuggingFace repo for LiteRT-LM model (auto-downloaded) |
+| `llm.litert_model_file` | `gemma-4-E2B-it.litertlm` | Model filename within the repo |
+| `llm.model_path` | `../resources/multimodal/gemma-4-E2B-it` | Path for Transformers backend (relative to `backend/`) |
+| `llm.device` | `auto` | Transformers backend: `auto`, `cuda`, or `cpu` |
 | `llm.enable_thinking` | `false` | Default thinking mode (overridden per-session via UI) |
 | `llm.max_new_tokens` | `512` | Max tokens to generate |
-| `llm.image_token_budget` | `70` | Vision resolution — tokens per image (70/140/280/560/1120). Lower = faster, less detail |
+| `llm.image_token_budget` | `70` | Transformers backend: vision resolution (70/140/280/560/1120 tokens) |
 | `tts.voice` | `af_heart` | Kokoro voice name |
 | `tts.speed` | `1.0` | Speech speed multiplier |
 | `vision.frame_interval` | `1.5` | Seconds between screen captures |
@@ -207,7 +217,8 @@ local-screen-vision-ai/
 │   ├── requirements.txt
 │   └── handlers/
 │       ├── stt.py           # faster-whisper STT
-│       ├── llm.py           # Gemma 4 E2B-it (bfloat16 GPU, streaming + batch)
+│       ├── llm_litert.py    # Gemma 4 via LiteRT-LM (int4 XNNPACK, default)
+│       ├── llm.py           # Gemma 4 via HF Transformers (bfloat16 GPU, fallback)
 │       ├── tts.py           # kokoro-onnx (auto-download) + Windows SAPI fallback
 │       ├── hardware.py      # CPU / RAM / GPU monitoring (nvidia-ml-py)
 │       └── vad.py           # WebRTC VAD + energy fallback + stateless has_speech()
@@ -231,12 +242,40 @@ local-screen-vision-ai/
 ├── resources/
 │   └── multimodal/              # Place gemma-4-E2B-it here
 ├── start-backend.ps1            # PowerShell launcher (activates venv)
-└── start-backend.bat            # CMD launcher
+├── start-backend.bat            # CMD launcher
+└── start-backend-wsl.bat        # WSL launcher (LiteRT-LM via Ubuntu venv)
 ```
 
 ---
 
 ## Lessons Learned
+
+### LiteRT-LM backend
+
+- [LiteRT-LM](https://ai.google.dev/edge/litert-lm) is Google's open-source inference framework for edge devices. It runs quantized models (int4) with XNNPACK CPU acceleration — no GPU or CUDA needed.
+- The Python API (`litert-lm-api-nightly`) uses `Engine` and `Conversation` context managers. The `Engine` loads the `.litertlm` model file; each `Conversation` manages chat state internally.
+- Multimodal inputs (images, audio) are passed as **file paths**, not raw arrays. The handler writes temp files before inference and cleans them up afterward.
+- Streaming uses `conversation.send_message_async()` which returns a synchronous chunk iterator. We run it in a thread executor and bridge to asyncio via `Queue` + `call_soon_threadsafe`, identical to the Transformers streaming pattern.
+- The model (`gemma-4-E2B-it.litertlm`, ~2.58 GB) is auto-downloaded from HuggingFace via `hf_hub_download()` on first run and cached locally.
+- Vision support depends on the backend and model. The CPU backend for `gemma-4-E2B-it.litertlm` does **not** include a vision encoder (`TF_LITE_VISION_ENCODER not found`). The handler probes for vision during load and silently skips image inputs if unsupported, preventing crashes.
+
+### WSL (Windows Subsystem for Linux)
+
+- `litert-lm-api-nightly` only publishes **Linux** wheels — no Windows binaries. Running the backend inside WSL2 (Ubuntu) is the simplest workaround. A `start-backend-wsl.bat` launcher invokes the WSL Python venv from Windows.
+- `webrtcvad` depends on `pkg_resources`, which was removed in `setuptools` ≥ 81. Fix: `pip install 'setuptools<81'` inside the WSL venv to restore compatibility.
+- `pywin32` (Windows SAPI TTS fallback) is unavailable in Linux/WSL. `kokoro-onnx` is the TTS backend when running in WSL.
+
+### GPU acceleration in WSL
+
+- WSL2 exposes the host NVIDIA GPU for **CUDA** workloads — `nvidia-smi` works and reports the card correctly.
+- However, LiteRT-LM's GPU backend uses **WebGPU/Vulkan**, not CUDA. In WSL2, Vulkan falls back to **llvmpipe** (a software renderer), making the "GPU" path ~21× slower than native CPU (24.9 s vs 1.16 s for a single response on an RTX 2070 SUPER).
+- Until LiteRT-LM adds a CUDA backend, or WSL gets proper Vulkan GPU passthrough, the **CPU backend with XNNPACK** remains the fastest option.
+- Benchmarked (RTX 2070 SUPER, WSL2 Ubuntu, Gemma 4 E2B-it):
+
+| Backend | Engine load | Response time |
+|---------|-------------|---------------|
+| CPU (XNNPACK) | 0.3 s | **1.16 s** |
+| "GPU" (llvmpipe software Vulkan) | 2.1 s | **24.9 s** |
 
 ### GPU / PyTorch
 

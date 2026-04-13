@@ -14,7 +14,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import config
 from handlers.hardware import get_hardware_info
-from handlers.llm import LLMHandler
 from handlers.stt import STTHandler
 from handlers.tts import TTSHandler
 from handlers.vad import VADHandler
@@ -56,13 +55,30 @@ stt = STTHandler(
     model_name=config["stt"]["model"],
     language=config["stt"]["language"],
 )
-llm = LLMHandler(
-    model_path=config["llm"]["model_path"],
-    device=config["llm"]["device"],
-    enable_thinking=config["llm"]["enable_thinking"],
-    max_new_tokens=config["llm"]["max_new_tokens"],
-    image_token_budget=config["llm"]["image_token_budget"],
-)
+
+_llm_backend = config["llm"].get("backend", "litert")
+if _llm_backend == "litert":
+    from handlers.llm_litert import LiteRTLMHandler
+
+    llm = LiteRTLMHandler(
+        model_repo=config["llm"]["litert_model_repo"],
+        model_file=config["llm"]["litert_model_file"],
+        max_new_tokens=config["llm"]["max_new_tokens"],
+        enable_thinking=config["llm"]["enable_thinking"],
+    )
+    logger.info("LLM backend: LiteRT-LM (Gemma 4 E2B-it)")
+else:
+    from handlers.llm import LLMHandler
+
+    llm = LLMHandler(
+        model_path=config["llm"]["model_path"],
+        device=config["llm"]["device"],
+        enable_thinking=config["llm"]["enable_thinking"],
+        max_new_tokens=config["llm"]["max_new_tokens"],
+        image_token_budget=config["llm"]["image_token_budget"],
+    )
+    logger.info("LLM backend: HuggingFace Transformers (Gemma 4)")
+
 tts = TTSHandler(
     voice=config["tts"]["voice"],
     speed=config["tts"]["speed"],

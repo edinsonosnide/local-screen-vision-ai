@@ -7,11 +7,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "server": {"host": "0.0.0.0", "port": 8000},
     "stt": {"model": "base", "language": "en"},
     "llm": {
+        "backend": "litert",  # "litert" (LiteRT-LM, optimized) or "transformers" (HF, GPU)
+        # LiteRT-LM settings
+        "litert_model_repo": "litert-community/gemma-4-E2B-it-litert-lm",
+        "litert_model_file": "gemma-4-E2B-it.litertlm",
+        # HuggingFace Transformers settings
         "model_path": "./resources/multimodal/gemma-4-E4B-it",
         "device": "auto",
+        "image_token_budget": 70,
+        # Shared
         "enable_thinking": False,
         "max_new_tokens": 512,
-        "image_token_budget": 280,
     },
     "tts": {
         "voice": "af_heart",

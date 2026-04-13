@@ -7,11 +7,17 @@ stt:
   language: "en"
 
 llm:
+  backend: "litert"      # "litert" (LiteRT-LM, optimized) or "transformers" (HF, GPU)
+  # LiteRT-LM settings — model is auto-downloaded from HuggingFace on first run
+  litert_model_repo: "litert-community/gemma-4-E2B-it-litert-lm"
+  litert_model_file: "gemma-4-E2B-it.litertlm"
+  # HuggingFace Transformers settings (used when backend: "transformers")
   model_path: "../resources/multimodal/gemma-4-E2B-it"
   device: "auto"         # auto, cpu, cuda
+  image_token_budget: 280  # 70, 140, 280, 560, 1120
+  # Shared settings
   enable_thinking: false
   max_new_tokens: 512
-  image_token_budget: 280  # 70, 140, 280, 560, 1120
 
 tts:
   voice: "af_heart"      # kokoro voice
