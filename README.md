@@ -15,8 +15,8 @@ All processing runs **100% locally** — no data leaves your machine after setup
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| STT (Whisper) | ✅ Working | `faster-whisper` base model, ~5-20ms |
-| LLM (Gemma 4 E2B-it) | ✅ Working on GPU | bfloat16, ~3-5s streaming on RTX 2070 SUPER |
+| STT (Whisper) | ✅ Working | `faster-whisper` base model |
+| LLM (Gemma 4 E2B-it) | ✅ Working on GPU | bfloat16, RTX 2070 SUPER |
 | LLM streaming | ✅ Working | Token-by-token output via `TextIteratorStreamer` |
 | Screen vision | ✅ Working | Model correctly reads and describes screen |
 | TTS (streaming) | ✅ Working | Sentence-by-sentence during LLM streaming, queued playback |
@@ -24,6 +24,16 @@ All processing runs **100% locally** — no data leaves your machine after setup
 | Direct Audio | ⚠️ Beta | Full recording (up to 30 s) sent to Gemma 4 natively |
 | WebSocket stability | ✅ Stable | Two-task reader pattern + cooldown prevents disconnects |
 | GPU acceleration | ✅ Working | Auto-detects CUDA, loads model in bfloat16 |
+
+### Observed Latency (RTX 2070 SUPER 8 GB, Whisper base, Thinking off)
+
+| Step | Audio + Screen ON | Audio ON, Screen OFF |
+|------|-------------------|----------------------|
+| **STT (Whisper)** | ~4 ms | ~25 ms |
+| **LLM (Gemma 4)** | ~53 s | ~5 s |
+| **TTS (SAPI)** | ~52 ms | ~123 ms |
+
+> Screen sharing dramatically increases LLM inference time because the model processes the captured image alongside the text prompt. With `image_token_budget` set to 70 (the current default), expect ~53 s per response with screen on vs ~5 s with screen off on an RTX 2070 SUPER.
 
 ---
 
@@ -142,7 +152,7 @@ Backend runs at `http://localhost:8000`.
 5. Response **streams word-by-word** in the ASSISTANT panel with a blinking cursor
 6. If TTS is enabled, audio plays sentence-by-sentence as text streams — you hear the answer while it's still being generated
 
-> **Tip**: First inference takes ~3-5s on an RTX 2070 SUPER with streaming. The UI shows a "Generating…" badge and blinking cursor during output.
+> **Tip**: With screen sharing **off**, inference takes ~5 s on an RTX 2070 SUPER. With screen sharing **on**, expect ~53 s because the model also processes the captured frame. The UI shows a "Generating…" badge and blinking cursor during output.
 
 ---
 
