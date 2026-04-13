@@ -1,0 +1,26 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+stt:
+  model: "base"          # whisper model: tiny, base, small, medium, large-v3
+  language: "en"
+
+llm:
+  model_path: "../resources/multimodal/gemma-4-E2B-it"
+  device: "auto"         # auto, cpu, cuda
+  enable_thinking: false
+  max_new_tokens: 512
+  image_token_budget: 280  # 70, 140, 280, 560, 1120
+
+tts:
+  voice: "af_heart"      # kokoro voice
+  speed: 1.0
+
+vision:
+  frame_interval: 2.0    # seconds between screen captures
+  max_frames_in_context: 1
+
+vad:
+  aggressiveness: 2      # 0-3 (higher = more aggressive filtering)
+  silence_duration: 0.8  # seconds of silence to trigger end-of-speech
